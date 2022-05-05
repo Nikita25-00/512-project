@@ -1,0 +1,564 @@
+---
+title: "ANLY-512 Final Project"
+author: "Nikita Pardeshi, Yuejiao Qiu, Jia Song, Xiana Zhang"
+date: "4/18/2022"
+output: 
+  bookdown::html_document2:
+    self_contained: yes
+    toc: yes
+    number_sections: yes
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+set.seed(51211)
+library(kableExtra)
+library(tidyverse)
+library(dplyr)
+library(visdat)
+library(reshape2)
+library(ggplot2)
+library(ggcorrplot)
+library(stargazer)
+library(glmnet)
+library(nnet)
+library(splines)
+library(GGally)
+library(caret)
+library(multiROC)
+library(dummies)
+library(cvms)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+library(gdata)
+library(e1071)
+```
+
+# Data
+## Data inspection and variables
+```{r load data}
+# Load data
+songs <- read.csv("songs.csv") %>%
+  mutate(genre = as.factor(genre))
+head(songs[,-1])
+```
+
+```{r type}
+str(songs)
+```
+
+```{r type viz, fig.align='center'}
+# Type of variables
+vis_dat(songs)
+```
+```{r}
+is.na(songs) %>% colSums()
+```
+
+## Data cleaning
+```{r data cleaning}
+# Data cleaning
+songs_clean <- songs %>%
+  select(-track_id, -name, -artists)
+#  mutate(mode = as.factor(mode)) # mode takes only 0 (minor) or 1 (major)
+```
+
+```{r outlier, message=F, fig.align='center', fig.width=9, fig.height = 6}
+# boxplot of audio features
+ggplot(melt(songs_clean[,-c(1,6)]), aes(y = value, fill = variable)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free") + 
+  theme(legend.position="none")
+
+# drop outliers in loundness
+songs_clean <- songs_clean %>%
+  filter(loudness > -20)
+```
+
+# Descriptive statistics
+## Descriptive statistics
+```{r stats}
+# Summary
+as.data.frame(do.call(cbind, lapply(songs_clean[,-1], summary)))
+```
+
+## Balance check
+```{r balance}
+# Number of songs by genre
+songs_clean %>% 
+  count(genre) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "center")
+```
+
+```{r case count plot, fig.align='center', fig.width=8.5, fig.height = 5}
+ggplot(data = songs_clean, aes(y=genre)) +
+  geom_bar(aes(fill=genre)) +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Music Genres - Number of Cases and Percentages",
+                 y = "Genres",
+                 x = "Count") +
+  expand_limits(x = 1450) +
+  geom_text(stat='count', 
+            aes(label = sprintf('%s (%.1f%%)', 
+                after_stat(count), 
+                after_stat(count / sum(count) * 100))),
+            hjust=ifelse(1.5, -0.1, 1.1)) + 
+  scale_fill_brewer(palette="Accent")
+```
+
+# EDA
+## Audio features by genre
+```{r density, fig.align='center', fig.width=9, fig.height = 6}
+feature_names <- names(songs_clean)[c(2:12)]
+
+songs_clean %>%
+  select(-mode) %>%
+  pivot_longer(cols = feature_names[-5]) %>%
+  ggplot(aes(x = value, colour = genre)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~name, ncol = 4, scales = "free") +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Spotify Audio Feature Density by Genre',
+       x = '', y = 'Density') +
+  theme(axis.text.y = element_blank()) + 
+  scale_color_brewer(palette="Accent")
+```
+
+```{r boxplot, fig.align='center', fig.width=9.5, fig.height = 11}
+songs_clean %>%
+  select(-mode) %>%
+  pivot_longer(cols = feature_names[-5]) %>%
+  ggplot(aes(y = value, fill = genre)) +
+  geom_boxplot() +
+  facet_wrap(~name, ncol = 2, scales = "free") +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Spotify Audio Feature Boxplot by Genre',
+       x = '', y = '') +
+  scale_fill_brewer(palette="Accent")
+```
+
+## Correlation between audio features
+```{r correlation1, fig.align='center', fig.width=12, fig.height = 12}
+songs_clean %>%
+  select(feature_names) %>%
+  scale() %>%
+  cor() %>%
+  ggcorrplot(type = "upper", lab = T) + 
+  labs(title = "Correlation between Audio Features", x = "", y = "") +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  theme_gray()
+```
+
+Energy and loudness are fairly highly correlated (0.65). In this case, loudness will be removed, since energy appears to give more distinction between genre groups (as seen in the density and box plot).
+
+```{r remove loudness, warning=F, message=F}
+# remove loudness
+feature_names_reduced <- feature_names[-4]
+
+songs_clean <- songs_clean %>%
+  select(genre, feature_names_reduced)
+```
+
+## Correlation between genres
+```{r correlation2, fig.align='center', fig.width=7, fig.height = 7}
+# Create correlation matrix using median value of features
+genre_corr <- songs_clean %>%
+  group_by(genre) %>%
+  summarise_if(is.numeric, median, na.rm = TRUE) %>%
+  ungroup() %>%
+  select(-genre) %>%
+  scale() %>%
+  t() %>%
+  as.matrix() %>%
+  cor()
+
+colnames(genre_corr) <- levels(songs_clean$genre)
+row.names(genre_corr) <- levels(songs_clean$genre)
+
+ggcorrplot(genre_corr, type = "upper", lab = T) +
+  labs(title = "Correlation between Genres", x = "", y = "") +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  theme_gray()
+```
+
+# Feature selection
+## Logistic regression
+```{r binary logistic regression}
+logit <- glm(genre ~., data = songs_clean, family = binomial)
+
+summary(logit)
+#stargazer(logit, type = 'html', summary = T, report = "vc*stp", ci=T)
+```
+
+## PCA
+```{r scree plot, fig.align='center', fig.width=6, fig.height = 4}
+songs_scaled <- songs_clean %>%
+  mutate_if(is.numeric, scale)
+
+song_cov <- cov(songs_scaled[,feature_names_reduced])
+song_eigen <- eigen(song_cov)
+
+data.frame(proporation_of_variance = song_eigen$values/sum(song_eigen$values)) %>%
+  mutate(cumulative_prop = cumsum(proporation_of_variance),
+         pc = 1:n()) %>%
+  ggplot(aes(x = pc, y = cumulative_prop)) + 
+  geom_point() + 
+  geom_line() +
+  ylim(c(0,1)) +
+  theme (plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Cumulative Scree Plot', 
+       x = 'Principal Component', 
+       y = 'Cumulative % of variance explained') 
+```
+
+```{r PCA loadings, fig.align='center', fig.width=8, fig.height = 6}
+song_eigenvectors <- song_eigen$vectors[,1:2] * -1
+song_eigenvectors <- song_eigenvectors %>%
+  as.data.frame() %>%
+  mutate(feature = row.names(song_cov)) %>%
+  rename('PC1' = 'V1',
+         'PC2' = 'V2')
+
+song_eigenvectors %>%
+  pivot_longer(cols = c('PC1', 'PC2')) %>%
+  ggplot(aes(x = feature, y = value)) + 
+  geom_col(aes(fill = feature), position = 'dodge') +
+  facet_wrap(~name, ncol = 2) +
+  coord_flip() +
+  labs(title = 'Principal Component Loadings', x = 'Feature', y = '') + 
+  theme(legend.position="none", plot.title = element_text(hjust = 0.5))
+```
+```{r PC plot, fig.align='center', fig.width=10, fig.height = 6.25}
+PC <- data.frame(
+	genre = songs_scaled$genre,
+    PC1 = as.matrix(songs_scaled[,feature_names_reduced]) %*% song_eigenvectors[,1], 
+    PC2 = as.matrix(songs_scaled[,feature_names_reduced]) %*% song_eigenvectors[,2])
+
+PC %>% 
+  ggplot(aes(x = PC1, y = PC2, color = genre)) + 
+  geom_point(alpha = 0.6) + 
+  facet_wrap(~genre) +
+  labs(title = 'Plotting principal components 1 vs 2') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_brewer(palette="Accent")
+
+```
+
+# Classification models
+## Data split
+```{r data split}
+set.seed(51211)
+
+songs_clean <- songs_clean %>% 
+  mutate(mode = as.factor(mode)) %>% 
+  mutate_if(is.numeric, scale)
+
+train_index <- sample(1:nrow(songs_clean), nrow(songs_clean)*.75, replace = F)
+trainSet <- songs_clean[train_index,]
+testSet <- songs_clean[-train_index,]
+```
+
+## Logistic regression
+### Basic
+```{r logistic regression, results='hide'}
+multi.log <- multinom(genre ~ danceability + energy + mode + speechiness + 
+                        acousticness + instrumentalness + valence + tempo, 
+                      data = trainSet)
+```
+
+```{r logistic regression summary, results='asis'}
+stargazer(multi.log, type = 'html', summary = T, report = "vc*stp", ci=T)
+```
+```{r logistic regression test}
+mean(predict(multi.log, type="class", newdata=testSet)==testSet$genre)
+```
+
+### With natural spline
+```{r ns, results='hide'}
+multi.log.ns <- 
+  multinom(genre ~ ns(danceability, df=5) + ns(energy, df=5) + mode + 
+           ns(speechiness, df=5) + ns(acousticness, df=5) + ns(instrumentalness, df=5) + 
+           ns(valence, df=5) + ns(tempo, df=5), data = songs_clean)
+```
+```{r ns results, results='asis'}
+stargazer(multi.log.ns, type = 'html', summary = T, report = "vc*stp", ci=T)
+```
+
+```{r ns accuracy}
+mean(predict(multi.log.ns, type="class", newdata=testSet)==testSet$genre)
+```
+
+```{r ns roc, warning=F, message=F, fig.align='center', fig.width=7, fig.height=5}
+plotMultiROC <- function(model) {
+  pred <- data.frame(predict(model, type="prob", newdata=testSet))
+  colnames(pred) <- paste(levels(testSet$genre), "_pred_M")
+  
+  true_lable <- data.frame(dummy(testSet$genre))
+  colnames(true_lable) <- paste(levels(testSet$genre), "_true")
+  
+  final <- cbind(true_lable, pred)
+  
+  roc_df <- plot_roc_data(multi_roc(final, force_diag = F)) %>%
+    filter(Group != "Micro", Group != "Macro")
+  pr_df <- plot_pr_data(multi_pr(final, force_diag = F))  %>%
+    filter(Group != "Micro", Group != "Macro")
+  
+  return(ggplot(roc_df, aes(x=1-Specificity, y=Sensitivity)) +
+    geom_path(aes(color=Group)) +
+    geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1), linetype = "dashed") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_brewer(palette="Accent"))
+}
+
+plotMultiROC(multi.log.ns) + labs(title = "Logistic Regression w/ Natrual Spline ROC", 
+                                  x = "FPR", y = "TPR")
+```
+
+```{r ns cm, fig.align='center', fig.width=8, fig.height=8}
+plotCM <- function(model){
+  return(plot_confusion_matrix(
+    as_tibble(confusionMatrix(predict(model, type="class", newdata=testSet),
+                              testSet$genre)$table), 
+    target_col = "Reference", prediction_col = "Prediction", counts_col = "n"))
+}
+
+plotCM(multi.log.ns)
+```
+
+## Tree based methods
+### Decision tree
+```{r dt}
+dt <- rpart(genre ~ danceability + energy + mode + speechiness + 
+              acousticness + instrumentalness + valence + tempo, data = trainSet)
+```
+
+```{r dt plot, fig.align='center', fig.width=8, fig.height=4.5}
+rpart.plot(dt, type = 5, extra = 104,
+           box.palette = list("#7fc97f", "#beaed4", "#fdc086",
+                              "#ffff99", "#386cb0", "#f0027f"),
+           leaf.round = 0, fallen.leaves = F, branch = 0.3, under = T, 
+           under.col = 'grey40', main = 'Decision Tree', tweak = 1.2)
+```
+
+```{r dt accuracy}
+mean(predict(dt, type="class", newdata=testSet)==testSet$genre)
+```
+
+```{r dt roc, warning=F, message=F, fig.align='center', fig.width=7, fig.height=5}
+plotMultiROC(dt) + labs(title = "Decision Tree ROC", x = "FPR", y = "TPR")
+```
+
+```{r dt cm, fig.align='center', fig.width=8, fig.height=8}
+plotCM(dt)
+```
+
+### Random forest
+```{r rf}
+rf <- randomForest(as.factor(genre) ~ danceability + energy + mode + speechiness + 
+              acousticness + instrumentalness + valence + tempo, data = trainSet, 
+              ntree = 100, importance = TRUE)
+```
+
+```{r rf accuracy}
+mean(predict(rf, testSet)==testSet$genre)
+```
+
+```{r rf roc, warning=F, message=F, fig.align='center', fig.width=7, fig.height=5}
+plotMultiROC(rf) + labs(title = "Random Forest ROC", x = "FPR", y = "TPR")
+```
+
+```{r rf cm, fig.align='center', fig.width=8, fig.height=8}
+plotCM(rf)
+```
+
+### Xgboost
+```{r xgb}
+matrix_train <- xgb.DMatrix(data = data.matrix(trainSet[,-1]), 
+                            label = as.integer(as.factor(trainSet[,1]))-1
+                            )
+matrix_test <- xgb.DMatrix(data = data.matrix(testSet[,-1]), 
+                           label = as.integer(as.factor(testSet[,1]))-1
+                           )
+
+xgb_class <- xgboost(data = matrix_train, 
+                    nrounds = 50,
+                    verbose = F,
+                    params = list(objective = "multi:softmax",
+                                  num_class = 6))
+
+xgb_prob <- xgboost(data = matrix_train, 
+                    nrounds = 50,
+                    verbose = F,
+                    params = list(objective = "multi:softprob",
+                                  num_class = 6))
+```
+
+```{r xgb accuracy}
+mean(predict(xgb_class, matrix_test)+1==as.integer(as.factor(testSet$genre)))
+```
+
+```{r xgb roc, warning=F, message=F, fig.align='center', fig.width=7, fig.height=5}
+pred_prob <- as.data.frame(matrix(predict(xgb_prob, newdata=matrix_test), 
+                                  nrow=nrow(testSet), byrow = T))
+colnames(pred_prob) <- paste(levels(testSet$genre), "_pred_XGB")
+
+true_lable <- data.frame(dummy(testSet$genre))
+colnames(true_lable) <- paste(levels(testSet$genre), "_true")
+
+final <- cbind(true_lable, pred_prob)
+
+roc_df <- plot_roc_data(multi_roc(final, force_diag = F)) %>%
+  filter(Group != "Micro", Group != "Macro")
+pr_df <- plot_pr_data(multi_pr(final, force_diag = F))  %>%
+  filter(Group != "Micro", Group != "Macro")
+
+ggplot(roc_df, aes(x=1-Specificity, y=Sensitivity)) +
+  geom_path(aes(color=Group)) +
+  geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1), linetype = "dashed") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_brewer(palette="Accent") + 
+  labs(title = "Gradient Boost ROC", x = "FPR", y = "TPR")
+```
+
+```{r xgb cm, fig.align='center', fig.width=8, fig.height=8}
+# map predicted class from integer to factor
+pred_class <- as.integer(predict(xgb_class, matrix_test) + 1)
+map <- mapLevels(x=levels(trainSet$genre))
+mapLevels(x=pred_class) <- map
+
+plot_confusion_matrix(as_tibble(confusionMatrix(pred_class, testSet$genre)$table), 
+                      target_col = "Reference", prediction_col = "Prediction", 
+                      counts_col = "n")
+```
+
+## SVM
+### Linear kernel
+```{r svm linear}
+svm.linear <- svm(as.factor(genre) ~ danceability + energy + mode + speechiness + 
+              acousticness + instrumentalness + valence + tempo, 
+              data = trainSet, kernel = "linear", cost = 10)
+
+mean(predict(svm.linear, testSet)==testSet$genre)
+```
+
+### Polynomial kernel
+```{r svm poly}
+svm.poly <- svm(as.factor(genre) ~ danceability + energy + mode + speechiness + 
+              acousticness + instrumentalness + valence + tempo, 
+              data = trainSet, kernel = "poly", cost = 10, probability = T)
+
+mean(predict(svm.poly, testSet)==testSet$genre)
+```
+
+```{r svm roc, warning=F, message=F, fig.align='center', fig.width=7, fig.height=5}
+svm_pred <- predict(svm.poly, testSet, probability = T)
+
+pred_prob <- as.data.frame(attr(svm_pred, "probabilities"))
+colnames(pred_prob) <- paste(colnames(pred_prob), "_pred_SVM")
+
+true_lable <- data.frame(dummy(testSet$genre))
+colnames(true_lable) <- paste(levels(testSet$genre), "_true")
+
+final <- cbind(true_lable, pred_prob)
+
+roc_df <- plot_roc_data(multi_roc(final, force_diag = F)) %>%
+  filter(Group != "Micro", Group != "Macro")
+pr_df <- plot_pr_data(multi_pr(final, force_diag = F))  %>%
+  filter(Group != "Micro", Group != "Macro")
+
+ggplot(roc_df, aes(x=1-Specificity, y=Sensitivity)) +
+  geom_path(aes(color=Group)) +
+  geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1), linetype = "dashed") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_brewer(palette="Accent") + 
+  labs(title = "Poly SVM ROC", x = "FPR", y = "TPR")
+```
+```{r svm cm, fig.align='center', fig.width=8, fig.height=8}
+plotCM(svm.poly)
+```
+
+## Comparison
+### Feature importance
+```{r feature importance, fig.align='center', fig.width=7, fig.height=5}
+# importance
+dt_imp <- as.data.frame(dt$variable)
+dt_imp$feature <- rownames(dt_imp)
+# mean decrease in impurity
+rf_imp <- as.data.frame(randomForest::importance(rf, 2))
+rf_imp$feature <- rownames(rf_imp)
+# gain
+xgb_imp <- xgb.importance(model = xgb_class) %>% 
+  select(Feature, Gain)
+
+imp <- dplyr::left_join(dt_imp, rf_imp, by = "feature") %>% 
+  dplyr::left_join(xgb_imp, by = c("feature" = "Feature")) %>%
+  rename('Xgboost' = 'Gain',
+         'Decision tree' = 'dt$variable',
+         'Random forest' = 'MeanDecreaseGini') 
+
+# scale importance for comparison
+imp %>%
+  mutate_if(is.numeric, scale, center = TRUE) %>%
+  pivot_longer(cols = c('Xgboost', 'Decision tree', 'Random forest')) %>%
+  rename('model' = 'name') %>%
+  ggplot(aes(x = reorder(feature, value, mean, na.rm = TRUE), 
+             y = value, color = model)) + 
+  geom_point(size = 2) + 
+  coord_flip() +
+  labs(title = 'Scaled Variable Importance by Model',
+       y = 'Scaled value', x = '') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_brewer(palette = 'Set2')
+```
+
+### Accuracy
+```{r genre accuracy, fig.align='center', fig.width=10, fig.height=6}
+data.frame(model = 'Logistic regression', actual = testSet$genre,
+                   predicted = predict(multi.log.ns, testSet, type = "class"),
+                   stringsAsFactors = FALSE) %>% 
+  rbind(data.frame(model = 'Decisoin tree', actual = testSet$genre,
+                   predicted = predict(dt, testSet, type = "class"),
+                   stringsAsFactors = FALSE)) %>% 
+  rbind(data.frame(model = 'Random forest', actual = testSet$genre,
+                   predicted = predict(rf, testSet, type = "class"),
+                   stringsAsFactors = FALSE)) %>% 
+  rbind(data.frame(model = 'Xgboost', actual = testSet$genre,
+                   predicted = pred_class,
+                   stringsAsFactors = FALSE)) %>% 
+  rbind(data.frame(model = 'SVM', actual = testSet$genre,
+                   predicted = predict(svm.poly, testSet),
+                   stringsAsFactors = FALSE)) %>% 
+  count(actual, predicted, model) %>%
+  mutate(match = ifelse(actual == predicted, TRUE, FALSE)) %>%
+  group_by(actual, model) %>%
+  mutate(pct = n/sum(n)) %>% 
+  ungroup() %>%
+  mutate(label = ifelse(match == TRUE, 
+                        paste0(round(pct * 100,1),'%'), 
+                        ""),
+         model = factor(model, levels = c('Decisoin tree','Random forest','Xgboost',
+                                          'Logistic regression','SVM'))) %>%
+  ggplot(aes(x = actual, 
+             y = pct, 
+             fill = predicted, 
+             label = label)) +
+  geom_col(position = 'dodge') +
+  geom_text(position = position_dodge(width = 1), 
+            cex = 2.75, 
+            hjust = -0.1) +
+  facet_wrap(~ model, ncol = 3) +
+  coord_flip() + 
+  labs(title = 'Genre Accuracy by Model',
+       x= "",
+       y = 'Percent classified',
+       fill = "") +
+  ylim(c(0,.85)) +
+  theme(panel.grid.major.y = element_blank(), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Accent") 
+```
+
